@@ -28,7 +28,6 @@ CASE_SUBJECT_MARKER = "linkeddata.overheid.nl/terms/jurisprudentie/id/"
 # that DAG used to parse these into a second, independent database; folding
 # it in here means one download/parse of the export instead of two.
 LAW_SUBJECT_MARKER = "linkeddata.overheid.nl/terms/bwb/id/"
-LAW_ID_PREFIX = "http://linkeddata.overheid.nl/terms/bwb/id/"
 
 REGELING_ONDERDELEN: dict[str, str] = {
     "http://linkeddata.overheid.nl/terms/Wet": "wet",
@@ -274,8 +273,10 @@ def _parse_referentie(raw: str) -> dict[str, str | None]:
 
 
 def _strip_law_lido_id(url: str) -> str | None:
-    if url.startswith(LAW_ID_PREFIX) and len(url) > len(LAW_ID_PREFIX):
-        return url[len(LAW_ID_PREFIX):]
+    # Scheme-agnostic, like _subject_to_law_row: http:// and https:// both match.
+    scheme, sep, rest = url.partition("://")
+    if sep and scheme in ("http", "https") and rest.startswith(LAW_SUBJECT_MARKER):
+        return rest[len(LAW_SUBJECT_MARKER):] or None
     return None
 
 
@@ -336,11 +337,14 @@ def resolve_case_law_links(conn: sqlite3.Connection) -> int:
     Resumable: a raw refereertAan value always contains "|" (every entry is
     at least linktype=...|target=...); the cleaned/rewritten form never does
     (a clean ECLI list, or empty). So citations_outgoing no longer containing
-    "|" means this row was already fully handled by a previous run (its
-    legislations_cited/case_law resolution happened in the same pass, same
-    flush) and is skipped -- safe to interrupt and rerun."""
+    "|" means this row's refereertAan entries were already handled by a
+    previous run (its legislations_cited/case_law resolution happened in the
+    same pass, same flush). A row with no refereertAan at all has an empty
+    citations_outgoing from the start, so its linkt URIs are resolved unless
+    case_law already holds rows for that ECLI -- safe to interrupt and rerun."""
     read_cursor = conn.cursor()
     write_cursor = conn.cursor()
+    lookup_cursor = conn.cursor()
 
     law_index = _LawIndex(conn)
 
@@ -367,12 +371,19 @@ def resolve_case_law_links(conn: sqlite3.Connection) -> int:
 
     read_cursor.execute("SELECT ecli, citations_outgoing, legislations_cited FROM metadata")
     for ecli, raw_citations, raw_legislations in read_cursor:
-        if raw_citations is None or "|" not in raw_citations:
-            continue  # already processed by a previous, interrupted run
+        has_raw_citations = raw_citations is not None and "|" in raw_citations
+        if not has_raw_citations:
+            if not raw_legislations:
+                continue  # nothing to resolve, or already processed
+            already_resolved = lookup_cursor.execute(
+                "SELECT 1 FROM case_law WHERE ecli = ? LIMIT 1", (ecli,)
+            ).fetchone()
+            if already_resolved:
+                continue  # linkt links written by a previous, interrupted run
 
         clean_citations: list[str] = []
 
-        for raw in raw_citations.split("\n"):
+        for raw in raw_citations.split("\n") if has_raw_citations else []:
             if not raw:
                 continue
             ref = _parse_referentie(raw)
@@ -398,7 +409,8 @@ def resolve_case_law_links(conn: sqlite3.Connection) -> int:
             if matched:
                 case_law_rows.append((ecli, matched, "lido-linkt", None, None))
 
-        citation_updates.append(("\n".join(clean_citations), ecli))
+        if has_raw_citations:
+            citation_updates.append(("\n".join(clean_citations), ecli))
 
         if len(case_law_rows) >= _RESOLVE_BATCH_SIZE or len(citation_updates) >= _RESOLVE_BATCH_SIZE:
             _flush_resolution()
@@ -542,6 +554,12 @@ def parse_into_db(ttl_gz_path: Path, db_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     schema_sql = (Path(__file__).parent / "schema.sql").read_text()
     conn.executescript(schema_sql)
+    # law_element and case_law are derived entirely from this export, so a
+    # rebuild into an existing database starts them empty instead of
+    # appending a second copy (case_law) or keeping stale rows (law_element).
+    conn.execute("DELETE FROM case_law")
+    conn.execute("DELETE FROM law_element")
+    conn.commit()
 
     pending: dict[str, dict[str, list[str]]] = {}
     pending_law: dict[str, dict[str, list[str]]] = {}
@@ -572,6 +590,11 @@ def parse_into_db(ttl_gz_path: Path, db_path: Path) -> None:
                     # Ensure the subject is tracked even if no predicate maps to a
                     # column, so _subject_to_row can still derive the ECLI from the URI.
                     if subject not in pending:
+                        # Flush only when a new subject starts, so a subject's
+                        # triples are never split across two batches.
+                        if len(pending) >= BATCH_SIZE:
+                            total_written += _flush(conn, pending)
+                            pending.clear()
                         pending[subject] = defaultdict(list)
 
                     column = PREDICATE_MAP.get(predicate)
@@ -587,6 +610,9 @@ def parse_into_db(ttl_gz_path: Path, db_path: Path) -> None:
 
                 elif LAW_SUBJECT_MARKER in subject:
                     if subject not in pending_law:
+                        if len(pending_law) >= BATCH_SIZE:
+                            total_law_written += _flush_law(conn, pending_law)
+                            pending_law.clear()
                         pending_law[subject] = defaultdict(list)
 
                     column = LAW_PREDICATE_MAP.get(predicate)
@@ -598,13 +624,6 @@ def parse_into_db(ttl_gz_path: Path, db_path: Path) -> None:
                         continue
 
                     pending_law[subject][column].append(value)
-
-            if len(pending) >= BATCH_SIZE:
-                total_written += _flush(conn, pending)
-                pending.clear()
-            if len(pending_law) >= BATCH_SIZE:
-                total_law_written += _flush_law(conn, pending_law)
-                pending_law.clear()
 
     if pending:
         total_written += _flush(conn, pending)

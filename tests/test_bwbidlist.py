@@ -51,7 +51,7 @@ def test_build_law_aliases_extracts_zip_member_correctly(tmp_path: Path):
 
     with patch("src.bwbidlist.download_bwbidlist") as mock_download:
         written = build_law_aliases(db_path, zip_path)
-    mock_download.assert_called_once_with(zip_path)
+    mock_download.assert_not_called()  # an existing --bwb-zip is used as-is
 
     assert written == 4  # 4 aliases for the one regeling in SAMPLE_XML
 
@@ -64,3 +64,32 @@ def test_build_law_aliases_extracts_zip_member_correctly(tmp_path: Path):
         ("Burgerlijk Wetboek", "BWBR0005289", "bwbidlist"),
         ("Burgerlijk Wetboek Boek 6", "BWBR0005289", "bwbidlist"),
     ]
+
+
+def test_build_law_aliases_downloads_when_zip_is_missing(tmp_path: Path):
+    zip_path = tmp_path / "BWBIdList.xml.zip"
+
+    def fake_download(dest: Path) -> None:
+        with zipfile.ZipFile(dest, "w") as zf:
+            zf.writestr("BWBIdList.xml", SAMPLE_XML)
+
+    with patch("src.bwbidlist.download_bwbidlist", side_effect=fake_download) as mock_download:
+        build_law_aliases(tmp_path / "lido.db", zip_path)
+    mock_download.assert_called_once_with(zip_path)
+
+
+def test_build_law_aliases_rerun_does_not_duplicate(tmp_path: Path):
+    zip_path = tmp_path / "BWBIdList.xml.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        # "BW" twice for one regeling: as afkorting and as niet-officiele titel.
+        zf.writestr("BWBIdList.xml", SAMPLE_XML.replace(">BW6<", ">BW<"))
+    db_path = tmp_path / "lido.db"
+
+    build_law_aliases(db_path, zip_path)
+    written = build_law_aliases(db_path, zip_path)
+
+    assert written == 3
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM law_alias").fetchone()[0]
+    conn.close()
+    assert count == 3

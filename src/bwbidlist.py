@@ -74,9 +74,13 @@ def _parse_bwbidlist_xml(xml_path: Path) -> list[tuple[str, list[str]]]:
 
 
 def build_law_aliases(db_path: Path, zip_path: Path) -> int:
-    """Download+parse BWBIdList.xml.zip and insert its aliases into
-    law_alias in db_path. Returns the number of aliases written."""
-    download_bwbidlist(zip_path)
+    """Parse BWBIdList.xml.zip (downloading it first if zip_path does not
+    exist) and replace the 'bwbidlist' aliases in law_alias in db_path.
+    Returns the number of aliases written."""
+    if zip_path.exists():
+        print(f"{zip_path} already exists, skipping download.", file=sys.stderr)
+    else:
+        download_bwbidlist(zip_path)
 
     xml_path = zip_path.parent / "BWBIdList.xml"
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -87,11 +91,15 @@ def build_law_aliases(db_path: Path, zip_path: Path) -> int:
     conn.executescript(schema_sql)
 
     cursor = conn.cursor()
+    # law_alias has no unique key, so clear this source's rows first: a rerun
+    # replaces them instead of adding a second copy.
+    cursor.execute("DELETE FROM law_alias WHERE source = 'bwbidlist'")
     written = 0
     for bwb_id, aliases in _parse_bwbidlist_xml(xml_path):
-        for alias in aliases:
+        # The same title can appear under several headings for one regeling.
+        for alias in dict.fromkeys(aliases):
             cursor.execute(
-                "INSERT OR IGNORE INTO law_alias (alias, bwb_id, source) VALUES (?, ?, 'bwbidlist')",
+                "INSERT INTO law_alias (alias, bwb_id, source) VALUES (?, ?, 'bwbidlist')",
                 (alias, bwb_id),
             )
             written += 1

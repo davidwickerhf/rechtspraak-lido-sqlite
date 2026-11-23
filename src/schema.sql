@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS case_law (
     jc_id       TEXT,
     opschrift   TEXT
 );
+CREATE INDEX IF NOT EXISTS case_law_ecli ON case_law (ecli);
 
 -- BWB alias titles (e.g. "BW" -> BWBR0005289), from a separate download
 -- (BWBIdList.xml.zip), unrelated to the ttl.gz export. See bwbidlist.py.

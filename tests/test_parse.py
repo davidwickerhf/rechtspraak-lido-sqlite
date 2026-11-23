@@ -3,11 +3,13 @@ from pathlib import Path
 
 import pytest
 
+import src.parse
 from src.parse import (
     LAW_SUBJECT_MARKER,
     _LawIndex,
     _parse_referentie,
     _subject_to_law_row,
+    parse_into_db,
     resolve_case_law_links,
 )
 
@@ -228,3 +230,77 @@ def test_case_with_only_a_celex_identifier_uses_the_subject_ecli():
     subject = "http://linkeddata.overheid.nl/terms/jurisprudentie/id/ECLI:EU:C:2022:1"
     row = _subject_to_row(subject, {"ecli": ["CELEX:62022CJ0001"]})
     assert row[0] == "ECLI:EU:C:2022:1"
+
+
+LAW_LIDO_ID = "BWBR0005288/1723924/1992-01-01/1992-01-01"
+LAW_URI = "http://linkeddata.overheid.nl/terms/bwb/id/" + LAW_LIDO_ID
+
+
+def _insert_law(db_conn):
+    db_conn.execute(
+        "INSERT INTO law_element (type, bwb_id, bwb_label_id, lido_id, title) "
+        "VALUES ('artikel', 'BWBR0005288', '1723924', ?, 'Artikel 5:1')",
+        (LAW_LIDO_ID,),
+    )
+
+
+def test_law_index_accepts_https_lido_id(db_conn):
+    _insert_law(db_conn)
+    assert _LawIndex(db_conn).resolve(LAW_URI.replace("http://", "https://")) == LAW_LIDO_ID
+
+
+def test_resolve_case_law_links_handles_linkt_without_refereertaan(db_conn):
+    """A case with linkt links but no refereertAan used to be skipped as if it
+    had already been processed, so its links never reached case_law."""
+    _insert_law(db_conn)
+    db_conn.execute(
+        "INSERT INTO metadata (ecli, citations_outgoing, legislations_cited) VALUES (?, ?, ?)",
+        ("ECLI:NL:HR:2020:3", "", LAW_URI),
+    )
+    db_conn.commit()
+
+    assert resolve_case_law_links(db_conn) == 1
+    assert resolve_case_law_links(db_conn) == 0  # a rerun doesn't add it twice
+
+    rows = db_conn.execute("SELECT ecli, law_lido_id, source FROM case_law").fetchall()
+    assert rows == [("ECLI:NL:HR:2020:3", LAW_LIDO_ID, "lido-linkt")]
+
+
+CASE = "<https://linkeddata.overheid.nl/terms/jurisprudentie/id/ECLI:NL:HR:2020:{n}>"
+CREATOR = "<http://purl.org/dc/terms/creator>"
+LINKT = "<http://linkeddata.overheid.nl/terms/linkt>"
+RDF_TYPE = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"
+TITLE = "<http://purl.org/dc/terms/title>"
+
+
+def _ntriples() -> list[bytes]:
+    lines = [
+        f"<{LAW_URI}> {RDF_TYPE} <http://linkeddata.overheid.nl/terms/Artikel> .",
+        f'<{LAW_URI}> {TITLE} "Artikel 5:1" .',
+    ]
+    for n in range(3):
+        lines += [
+            f'{CASE.format(n=n)} {CREATOR} "Hoge Raad" .',
+            f"{CASE.format(n=n)} {LINKT} <{LAW_URI}> .",
+        ]
+    return [line.encode() for line in lines]
+
+
+def test_parse_into_db_keeps_subjects_whole_and_rebuilds_cleanly(tmp_path, monkeypatch):
+    """With a batch size of 2, the old flush cut the third case after its first
+    triple; and a second build into the same file duplicated case_law."""
+    monkeypatch.setattr(src.parse, "BATCH_SIZE", 2)
+    monkeypatch.setattr(src.parse, "_iter_ntriples", lambda _path: iter(_ntriples()))
+    db_path = tmp_path / "lido.db"
+
+    parse_into_db(tmp_path / "unused.ttl.gz", db_path)
+    parse_into_db(tmp_path / "unused.ttl.gz", db_path)
+
+    conn = sqlite3.connect(db_path)
+    creators = conn.execute("SELECT creator FROM metadata ORDER BY ecli").fetchall()
+    case_law_count = conn.execute("SELECT COUNT(*) FROM case_law").fetchone()[0]
+    law_title = conn.execute("SELECT title FROM law_element").fetchall()
+    conn.close()
+    assert creators == [("Hoge Raad",)] * 3
+    assert case_law_count == 3
+    assert law_title == [("Artikel 5:1",)]
